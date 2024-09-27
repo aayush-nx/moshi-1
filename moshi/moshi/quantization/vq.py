@@ -105,13 +105,13 @@ class ResidualVectorQuantizer(BaseQuantizer):
                 - `metrics` (dict): RVQ metrics, in particular rate of dead code replacement, and entropy.
         """
         n_q = self.n_q
-        x = self.input_proj(x)
+        x = self.input_proj(x) # [B, C, T] -> [B, D, T], let's use C for now
 
         bw_per_q = math.log2(self.bins) * frame_rate / 1000
-        quantized, codes, commit_loss, metrics = self.vq(x, n_q=n_q)
+        quantized, codes, commit_loss, metrics = self.vq(x, n_q=n_q) # [B, C, T], [n_q=K, B, T], [n_q], {something}
         B, _, _ = quantized.shape
         quantized = self.output_proj(quantized)
-        codes = codes.transpose(0, 1)
+        codes = codes.transpose(0, 1) # [B, K, T]
         # codes is [B, K, T], with T frames, K nb of codebooks.
         bw = torch.tensor(n_q * bw_per_q).to(x)
         return QuantizedResult(
@@ -127,18 +127,18 @@ class ResidualVectorQuantizer(BaseQuantizer):
         if x.shape[-1] == 0:
             return torch.empty((x.shape[0], n_q, 0), device=x.device, dtype=torch.int64)
 
-        x = self.input_proj(x)
-        codes = self.vq.encode(x, n_q=n_q)
-        codes = codes.transpose(0, 1)
+        x = self.input_proj(x) # [B, C, T]
+        codes = self.vq.encode(x, n_q=n_q) # [n_q, B, T]
+        codes = codes.transpose(0, 1) # [B, n_q, T]
         # codes is [B, K, T], with T frames, K nb of codebooks.
         return codes
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         """Decode the given codes to the quantized representation."""
         # codes is [B, K, T], with T frames, K nb of codebooks, vq.decode expects [K, B, T].
-        codes = codes.transpose(0, 1)
-        quantized = self.vq.decode(codes)
-        quantized = self.output_proj(quantized)
+        codes = codes.transpose(0, 1) # [B, n_q, T] -> [n_q, B, T]
+        quantized = self.vq.decode(codes) # [B, C, T]
+        quantized = self.output_proj(quantized) # [B, C, T]
         return quantized
 
     @property

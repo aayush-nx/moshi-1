@@ -181,10 +181,10 @@ class EuclideanCodebook(nn.Module):
         The codes are defined as the indexes of the centroids nearest to each vector in `x`.
         """
         assert x.dtype.is_floating_point, f"Input should be floats, got {x.dtype}"
-        shape = x.shape # Original shape: [B, ..., D]
-        x = self._reshape_input(x) # Flattened shape: [N, D] where N = B * ...
-        codes = self._quantize(x) # Shape: [N]
-        codes = self._reshape_codes(codes, shape) # Final shape: [B, ...]
+        shape = x.shape # Original shape: [B, ..., D]  # [B, T, C]
+        x = self._reshape_input(x) # Flattened shape: [N, D] where N = B * ...  # [B*T, C]
+        codes = self._quantize(x) # Shape: [N]  # [B*T] 
+        codes = self._reshape_codes(codes, shape) # Final shape: [B, ...]  # [B, T]
         return codes
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
@@ -194,18 +194,18 @@ class EuclideanCodebook(nn.Module):
         assert (
             not codes.dtype.is_floating_point
         ), f"Codes should be integers, got {codes.dtype}"
-        quantized = F.embedding(codes, self.embedding)
+        quantized = F.embedding(codes, self.embedding) # [B, T] -> [B, T, C]
         return quantized
 
     def forward(
         self, x: torch.Tensor, initialize: bool = True
     ) -> _CodebookForwardResult:
-        shape = x.shape
-        x = self._reshape_input(x)
+        shape = x.shape # [B, T, C]
+        x = self._reshape_input(x) # [B*T, C]   
 
-        flat_codes = self._quantize(x)
-        codes = self._reshape_codes(flat_codes, shape)
-        quantized = self.decode(codes)
+        flat_codes = self._quantize(x) # [B*T]  
+        codes = self._reshape_codes(flat_codes, shape) # [B, T]
+        quantized = self.decode(codes) # [B, T, C]  
         metrics: tp.Dict[str, torch.Tensor] = {}
 
         return _CodebookForwardResult(quantized, codes, metrics)
@@ -276,26 +276,26 @@ class VectorQuantization(nn.Module):
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encodes `x` into discrete integer codes."""
-        x = self._rearrange_input(x)
-        x = self.project_in(x)
-        codes = self._codebook.encode(x)
+        x = self._rearrange_input(x) # [B, C, T] -> [B, T, C]
+        x = self.project_in(x) # [B, T, C]
+        codes = self._codebook.encode(x) # [B, T]
         return codes
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         """Converts integer codes into quantized vectors."""
-        quantized = self._codebook.decode(codes)
-        quantized = self.project_out(quantized)
-        quantized = self._rearrange_output(quantized)
+        quantized = self._codebook.decode(codes) # [B, T, C]
+        quantized = self.project_out(quantized) # [B, T, C]
+        quantized = self._rearrange_output(quantized) # [B, C, T]
         return quantized
 
     def forward(self, x: torch.Tensor, initialize: bool = True) -> _VQForwardResult:
-        x = self._rearrange_input(x)
-        quantized, codes, metrics = self._codebook(x, initialize=initialize)
+        x = self._rearrange_input(x) # [B, C, T] -> [B, T, C]
+        quantized, codes, metrics = self._codebook(x, initialize=initialize) # [B, T, C], [B, T], {}
 
         loss = zero_scalar(x.device)
 
-        quantized = self.project_out(quantized)
-        quantized = self._rearrange_output(quantized)
+        quantized = self.project_out(quantized) # [B, T, C]
+        quantized = self._rearrange_output(quantized) # [B, C, T]
 
         return _VQForwardResult(quantized, codes, loss, metrics)
 
@@ -351,20 +351,20 @@ class ResidualVectorQuantization(nn.Module):
                     all_metrics[key] = value / n_q
                 all_metrics[key + f"_{i + self.codebook_offset}"] = value
 
-        out_losses, out_codes = map(torch.stack, (all_losses, all_codes))
-        return _VQForwardResult(quantized_out, out_codes, out_losses, all_metrics)
+        out_losses, out_codes = map(torch.stack, (all_losses, all_codes)) # [n_q], [n_q, B, T]  
+        return _VQForwardResult(quantized_out, out_codes, out_losses, all_metrics) # [B, C, T], [n_q, B, T], [n_q], {something}
 
     def encode(self, x: torch.Tensor, n_q: tp.Optional[int] = None) -> torch.Tensor:
         """Encodes `x` into discrete integer codes. If `n_q` is provided, only uses the first `n_q` codebook levels."""
-        residual = x
+        residual = x # [B, C, T]
         all_indices = []
         n_q = n_q or len(self.layers)
         for layer in self.layers[:n_q]:  # type: ignore
-            indices = layer.encode(residual)
-            quantized = layer.decode(indices)
+            indices = layer.encode(residual) # [B, T]
+            quantized = layer.decode(indices) # [B, C, T]
             residual = residual - quantized
             all_indices.append(indices)
-        out_indices = torch.stack(all_indices)
+        out_indices = torch.stack(all_indices) # [n_q, B, T]
         return out_indices
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
@@ -372,5 +372,5 @@ class ResidualVectorQuantization(nn.Module):
         quantized = zero_scalar(codes.device)
         for idx, layer_codes in enumerate(codes):
             layer = self.layers[idx]
-            quantized = quantized + layer.decode(layer_codes)
+            quantized = quantized + layer.decode(layer_codes) # [B, C, T]
         return quantized
