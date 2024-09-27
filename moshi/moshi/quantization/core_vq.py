@@ -1,13 +1,3 @@
-# Copyright (c) Kyutai, all rights reserved.
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
 import typing as tp
 
 from einops import rearrange
@@ -174,6 +164,7 @@ class EuclideanCodebook(nn.Module):
         return x
 
     def _reshape_codes(self, codes: torch.Tensor, shape: torch.Size) -> torch.Tensor:
+        # Reshape codes to match the input shape, excluding the last dimension
         return codes.view(*shape[:-1])
 
     def _quantize(self, x: torch.Tensor) -> torch.Tensor:
@@ -182,6 +173,7 @@ class EuclideanCodebook(nn.Module):
         assert x.dim() == 2
         dists = torch.cdist(x[None], self.embedding[None], p=2)[0]
         codes = dists.argmin(dim=-1)
+        # codes has shape [N], where N is the number of input vectors
         return codes
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
@@ -189,10 +181,10 @@ class EuclideanCodebook(nn.Module):
         The codes are defined as the indexes of the centroids nearest to each vector in `x`.
         """
         assert x.dtype.is_floating_point, f"Input should be floats, got {x.dtype}"
-        shape = x.shape
-        x = self._reshape_input(x)
-        codes = self._quantize(x)
-        codes = self._reshape_codes(codes, shape)
+        shape = x.shape # Original shape: [B, ..., D]
+        x = self._reshape_input(x) # Flattened shape: [N, D] where N = B * ...
+        codes = self._quantize(x) # Shape: [N]
+        codes = self._reshape_codes(codes, shape) # Final shape: [B, ...]
         return codes
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
