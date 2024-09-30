@@ -23,10 +23,14 @@ import torch
 
 
 class Resetable(tp.Protocol):
+    """Protocol for objects that can be reset to their initial state."""
+
     def reset(self) -> None:
+        """Reset the object to its initial state."""
         pass
 
 
+# Type variable for streaming state, constrained to be Resetable
 State = tp.TypeVar("State", bound=Resetable)
 
 
@@ -52,21 +56,30 @@ class StreamingModule(abc.ABC, nn.Module, tp.Generic[State]):
     Some module might also implement the `StreamingModule.flush` method, although
     this one is trickier, as all parents module must be StreamingModule and implement
     it as well for it to work properly. See `StreamingSequential` after.
+
+    This class provides methods for managing streaming state, including
+    initializing, starting, stopping, resetting, and propagating streaming
+    behavior to child modules. It also includes utilities for getting and
+    setting the complete streaming state of a module hierarchy.
     """
 
     def __init__(self) -> None:
+        """Initialize the StreamingModule."""
         super().__init__()
         self._streaming_state: State | None = None
         self._streaming_propagate: bool = True
 
     @property
     def is_streaming(self):
+        """Check if the module is in streaming mode."""
         return self._streaming_state is not None
 
     def set_streaming_propagate(self, streaming_propagate: bool):
+        """Set whether streaming should propagate to child modules."""
         self._streaming_propagate = streaming_propagate
 
     def _apply_named_streaming(self, fn: tp.Any):
+        """Apply a function to all streaming modules in the hierarchy."""
         def _handle_module(prefix: str, module: nn.Module, recurse: bool = True):
             propagate = True
             if isinstance(module, StreamingModule):
@@ -85,12 +98,14 @@ class StreamingModule(abc.ABC, nn.Module, tp.Generic[State]):
             _handle_module(name, child)
 
     def _start_streaming(self, batch_size: int):
+        """Start streaming mode for all modules in the hierarchy."""
         def _start_streaming(name: str, module: StreamingModule):
             module._streaming_state = module._init_streaming_state(batch_size)
 
         self._apply_named_streaming(_start_streaming)
 
     def _stop_streaming(self):
+        """Stop streaming mode for all modules in the hierarchy."""
         def _stop_streaming(name: str, module: StreamingModule):
             module._streaming_state = None
 
@@ -100,12 +115,12 @@ class StreamingModule(abc.ABC, nn.Module, tp.Generic[State]):
     def _init_streaming_state(self, batch_size: int) -> State: ...
 
     def streaming_forever(self, batch_size: int):
+        """Start streaming mode indefinitely."""
         self._start_streaming(batch_size)
 
     @contextmanager
     def streaming(self, batch_size: int):
         """Context manager to enter streaming mode. Reset streaming state on exit."""
-
         self._start_streaming(batch_size)
         try:
             yield
@@ -113,8 +128,7 @@ class StreamingModule(abc.ABC, nn.Module, tp.Generic[State]):
             self._stop_streaming()
 
     def reset_streaming(self):
-        """Reset the streaming state."""
-
+        """Reset the streaming state for all modules in the hierarchy."""
         def _reset(name: str, module: StreamingModule):
             state = module._streaming_state
             if state is None:
@@ -153,32 +167,70 @@ class StreamingModule(abc.ABC, nn.Module, tp.Generic[State]):
 
 @dataclass
 class _NullState:
+    """A null state class for streaming modules that don't require state."""
     pass
 
     def reset(self) -> None:
+        """Reset method (no-op for null state)."""
         pass
 
 
 class StreamingContainer(StreamingModule[_NullState]):
+    """
+    A streaming container that doesn't require any state.
+    This class is used as a base for streaming modules that don't need to maintain
+    any internal state between calls. It initializes with a null state (_NullState)
+    and can be used to wrap other streaming modules or as a parent class for
+    stateless streaming components.
+    """
+
     def _init_streaming_state(self, batch_size: int) -> _NullState:
         return _NullState()
 
 
 @dataclass
 class _StreamingAddState:
+    """
+    State for StreamingAdd module.
+    Stores previous tensors for x and y to handle streaming addition.
+    """
     previous_x: torch.Tensor | None = None
     previous_y: torch.Tensor | None = None
 
     def reset(self):
+        """Reset the state by setting previous tensors to None."""
         self.previous_x = None
         self.previous_y = None
 
 
 class StreamingAdd(StreamingModule[_StreamingAddState]):
+    """
+    A streaming module that performs element-wise addition of two tensors.
+    
+    This module handles streaming addition by maintaining state for partial
+    inputs and aligning tensors of different lengths. It supports both
+    streaming and non-streaming modes of operation.
+    """
+
     def _init_streaming_state(self, batch_size: int) -> _StreamingAddState:
+        """Initialize the streaming state for the StreamingAdd module."""
         return _StreamingAddState()
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor):
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Perform element-wise addition of two tensors, handling streaming and non-streaming cases.
+
+        In non-streaming mode, simply adds x and y.
+        In streaming mode, concatenates with previous partial inputs, aligns tensors,
+        updates the streaming state, and returns the sum of aligned portions.
+
+        Args:
+            x (torch.Tensor): First input tensor.
+            y (torch.Tensor): Second input tensor.
+
+        Returns:
+            torch.Tensor: Result of element-wise addition.
+        """
         if self._streaming_state is None:
             return x + y
         else:
@@ -203,6 +255,18 @@ class _StreamingConvState:
 
 
 class RawStreamingConv1d(nn.Conv1d, StreamingModule[_StreamingConvState]):
+    """
+    A streaming 1D convolution layer that supports both streaming and non-streaming modes.
+
+    This class extends nn.Conv1d and implements the StreamingModule interface to handle
+    streaming convolution operations. It maintains a state of previous inputs to ensure
+    correct convolution across streaming chunks.
+
+    Args:
+        *args: Variable length argument list for nn.Conv1d.
+        **kwargs: Arbitrary keyword arguments for nn.Conv1d.
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.padding[0] == 0, "Padding should be handled outside."
@@ -211,9 +275,29 @@ class RawStreamingConv1d(nn.Conv1d, StreamingModule[_StreamingConvState]):
         ), "stride must be less than kernel_size."
 
     def _init_streaming_state(self, batch_size: int) -> _StreamingConvState:
+        """Initialize the streaming state for the convolution layer."""
         return _StreamingConvState()
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """
+        Perform the forward pass of the streaming convolution.
+
+        In non-streaming mode, it behaves like a regular Conv1d.
+        In streaming mode, it handles partial inputs and maintains state across calls.
+
+        Args:
+            input (torch.Tensor): Input tensor of shape (B, C, T).
+
+        Returns:
+            torch.Tensor: Output tensor after convolution.
+
+        Note:
+            In streaming mode, this method uses the `previous` attribute of the
+            streaming state to store and retrieve information from previous calls.
+            The `previous` tensor contains the tail end of the input from the last
+            call, which is prepended to the current input to ensure continuity
+            in the convolution operation across chunk boundaries.
+        """
         stride = self.stride[0]
         # Effective kernel size accounting for dilation.
         kernel = (self.kernel_size[0] - 1) * self.dilation[0] + 1
@@ -225,16 +309,22 @@ class RawStreamingConv1d(nn.Conv1d, StreamingModule[_StreamingConvState]):
             if previous is not None:
                 input = torch.cat([previous, input], dim=-1)
             B, C, T = input.shape
-            # We now compute the number of full convolution frames, i.e. the frames
-            # that are ready to be computed.
+            # Compute the number of full convolution frames ready to be processed
+            # This formula allows for one output frame when input length equals kernel size
+            # For a more conservative approach (input > kernel size):
+            # num_frames = max(0, int(math.floor((T - kernel - 1) / stride) + 1))
             num_frames = max(0, int(math.floor((T - kernel) / stride) + 1))
+            
+
+            # Calculate the offset in the input tensor up to which data has been processed
+            # offset represents the position beyond which data will be used in future computations
+            # Data before offset will not be used again, as we advance by 'stride' for each frame
             offset = num_frames * stride
-            # We will compute `num_frames` outputs, and we are advancing by `stride`
-            # for each of the frame, so we know the data before `stride * num_frames`
-            # will never be used again.
             self._streaming_state.previous = input[..., offset:]
             if num_frames > 0:
                 input_length = (num_frames - 1) * stride + kernel
+                # - (num_frames - 1) * stride calculates the starting position of the last frame.
+                # - Adding kernel ensures we include all the elements needed for the last frame.
                 out = super().forward(input[..., :input_length])
             else:
                 # Not enough data as this point to output some new frames.
@@ -255,6 +345,31 @@ class _StreamingConvTrState:
 class RawStreamingConvTranspose1d(
     nn.ConvTranspose1d, StreamingModule[_StreamingConvTrState]
 ):
+    """
+    A streaming version of ConvTranspose1d that can process input in chunks.
+
+    This class extends nn.ConvTranspose1d and implements the StreamingModule interface.
+    It allows for efficient processing of input in a streaming fashion, maintaining
+    internal state between calls to handle partial results.
+
+    Args:
+        *args: Variable length argument list passed to nn.ConvTranspose1d.
+        **kwargs: Arbitrary keyword arguments passed to nn.ConvTranspose1d.
+
+    Attributes:
+        _streaming_state (_StreamingConvTrState): Stores the partial results between calls.
+            The 'partial' field in this state represents the overlapping output
+            that needs to be combined with the next chunk's output.
+
+    Note:
+        - Padding should be handled outside this module (padding[0] must be 0).
+        - Dilation is not supported (must be 1).
+        - Stride must be less than or equal to kernel_size.
+        - Output padding is not supported (must be 0).
+        - The 'partial' results are crucial for maintaining continuity between
+          chunks in streaming mode, ensuring correct output reconstruction.
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.padding[0] == 0, "Padding should be handled outside."
@@ -265,9 +380,23 @@ class RawStreamingConvTranspose1d(
         assert self.output_padding[0] == 0, "Output padding not supported."
 
     def _init_streaming_state(self, batch_size: int) -> _StreamingConvTrState:
+        """Initialize the streaming state."""
         return _StreamingConvTrState()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore
+        """
+        Forward pass of the streaming transposed convolution.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, T).
+
+        Returns:
+            torch.Tensor: Output tensor after transposed convolution.
+
+        Note:
+            When in streaming mode, this method handles partial results and
+            maintains the internal state between calls.
+        """
         B, C, T = x.shape
         stride = self.stride[0]
         kernel = self.kernel_size[0]
@@ -304,6 +433,21 @@ class RawStreamingConvTranspose1d(
 
 
 def test():
+    """
+    Test function to validate the behavior of RawStreamingConv1d and RawStreamingConvTranspose1d.
+
+    This function tests various combinations of kernel sizes, strides, and input lengths
+    for both streaming and non-streaming modes. It ensures that the streaming implementation
+    produces the same results as the non-streaming version within a small tolerance.
+
+    The test covers:
+    - Different kernel sizes and strides
+    - Various input lengths
+    - Both CPU and CUDA (if available) computations
+    - Streaming mode with different chunk sizes
+
+    Assertions are used to verify the correctness of shapes and output values.
+    """
     torch.manual_seed(1234)
     device = "cpu"
     if torch.cuda.is_available():
