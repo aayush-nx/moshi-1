@@ -25,20 +25,36 @@ CONV_NORMALIZATIONS = frozenset(["none", "weight_norm"])
 
 
 class TransposedLayerNorm(nn.Module):
-    """LayerNorm for [B, C, T] inputs."""
+    """LayerNorm for [B, C, T] inputs.
+    
+    This module applies Layer Normalization to tensors with shape [B, C, T],
+    where B is batch size, C is number of channels, and T is sequence length.
+    It transposes the input to apply standard LayerNorm, then transposes back.
+    """
 
     def __init__(self, **kwargs):
         super().__init__()
         self.layer_norm = nn.LayerNorm(**kwargs)
 
     def forward(self, x):
-        x = x.transpose(1, 2)
+        x = x.transpose(1, 2) # Change to [B, T, C] for LayerNorm
         x = self.layer_norm(x)
-        return x.transpose(1, 2)
+        return x.transpose(1, 2) # Change back to [B, C, T]
 
 
 def apply_parametrization_norm(module: nn.Module, norm: str = "none"):
+    """
+    Apply parametrization normalization to the given module.
+    
+    Args:
+        module (nn.Module): The module to apply normalization to.
+        norm (str): The type of normalization to apply. Default is "none".
+    
+    Returns:
+        nn.Module: The module with applied normalization.
+    """
     assert norm in CONV_NORMALIZATIONS
+    
     if norm == "weight_norm":
         return weight_norm(module)
     else:
@@ -50,7 +66,26 @@ def apply_parametrization_norm(module: nn.Module, norm: str = "none"):
 def get_extra_padding_for_conv1d(
     x: torch.Tensor, kernel_size: int, stride: int, padding_total: int = 0
 ) -> int:
-    """See `pad_for_conv1d`."""
+    """
+    Calculate the extra padding needed for a 1D convolution to ensure the output length is consistent.
+
+    This function computes the additional padding required at the end of the input tensor
+    to make sure that the last convolution window is full and the output length matches
+    the expected length after the convolution operation.
+
+    Args:
+        x (torch.Tensor): Input tensor of shape [B, C, T] where T is the sequence length.
+        kernel_size (int): Size of the convolutional kernel.
+        stride (int): Stride of the convolution.
+        padding_total (int, optional): Total padding already applied to the input. Defaults to 0.
+
+    Returns:
+        int: The amount of extra padding needed at the end of the input tensor.
+
+    Note:
+        This function is used in conjunction with `pad_for_conv1d` to ensure
+        consistent output lengths in convolutional operations.
+    """
     length = x.shape[-1]
     n_frames = (length - kernel_size + padding_total) / stride + 1
     ideal_length = (math.ceil(n_frames) - 1) * stride + (kernel_size - padding_total)
