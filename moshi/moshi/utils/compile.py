@@ -35,8 +35,21 @@ def no_compile():
 
 
 def torch_compile_lazy(fun):
-    """torch.compile creates a huge pool of processes, even when not using the function at all,
-    e.g. with Dora. This can polute stderr when doing CTRL+C. So we do it in a lazy way.
+    """
+    This function is a decorator that lazily applies torch.compile to the given function.
+    It addresses the issue of torch.compile creating a large pool of processes even when
+    the function is not used, which can pollute stderr on CTRL+C.
+
+    The decorator does the following:
+    1. If the environment variable NO_TORCH_COMPILE is set, it returns the original function.
+    2. It only compiles the function when it's first called, not at decoration time.
+    3. It respects the global _compile_disabled flag to conditionally disable compilation.
+
+    Args:
+        fun (callable): The function to be compiled.
+
+    Returns:
+        callable: A wrapped version of the input function that is lazily compiled.
     """
     if os.environ.get("NO_TORCH_COMPILE"):
         return fun
