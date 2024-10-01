@@ -25,10 +25,25 @@ from .streaming import StreamingModule, StreamingContainer
 
 
 class LayerNormF32(nn.LayerNorm):
+    """
+    Layer normalization that casts inputs to float32 for improved precision.
+
+    This class extends nn.LayerNorm to perform normalization in float32 precision,
+    regardless of the input tensor's dtype. This can help maintain numerical
+    stability, especially for mixed precision training.
+
+    Shape:
+        - Input: (*, C) where * is any number of dimensions and C is the number of channels.
+        - Output: (*, C), same shape as the input.
+
+    Returns:
+        torch.Tensor: The layer normalized tensor in the same dtype as the input.
+    """
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        x_f32 = input.float()
-        out_f32 = super().forward(x_f32)
-        return out_f32.to(input.dtype)
+        x_f32 = input.float()  # Cast to float32
+        out_f32 = super().forward(x_f32)  # Perform normalization in float32
+        return out_f32.to(input.dtype)  # Cast back to original dtype
 
 
 def _rms_norm(
@@ -36,7 +51,30 @@ def _rms_norm(
     alpha: torch.Tensor,
     dtype: tp.Optional[torch.dtype],
     eps: float,
-):
+) -> torch.Tensor:
+    """
+    Applies Root Mean Square (RMS) Normalization to the input tensor.
+
+    RMS Norm Formula:
+    y = (x / sqrt(mean(x^2) + eps)) * alpha
+
+    Args:
+        x (torch.Tensor): Input tensor of shape (B, T, C) where B is batch size,
+                          T is sequence length, and C is the number of channels.
+        alpha (torch.Tensor): Learnable scale parameter of shape (1, 1, C).
+        dtype (torch.dtype, optional): Data type to use for intermediate computations.
+        eps (float): Small constant added to the variance for numerical stability.
+
+    Returns:
+        torch.Tensor: Normalized tensor of the same shape as input (B, T, C).
+
+    Raises:
+        AssertionError: If input tensor is not 3-dimensional.
+
+    Note:
+        The mean is computed across the T dimension for each channel independently,
+        resulting in a tensor of shape (B, 1, C) which is then broadcast during normalization.
+    """
     assert x.dim() == 3, f"RMSNorm expects 3D inputs but got {x.shape}"
     x_dtype = x.dtype
     if dtype is not None:
@@ -47,6 +85,12 @@ def _rms_norm(
 
 
 class RMSNorm(nn.Module):
+    """
+    Root Mean Square (RMS) Normalization layer.
+
+    This layer applies RMS normalization to the input tensor, which normalizes the
+    activations of the layer for each sample in a batch using the RMS value.
+    """
     def __init__(
         self,
         dim: int,
@@ -130,26 +174,35 @@ def create_sin_embedding(
     max_period: float = 10000,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Create sinusoidal positional embedding, with shape `[B, T, C]`.
+    """
+    Create sinusoidal positional embedding for transformer models.
+
+    This function generates a sinusoidal positional embedding tensor that can be used
+    to inject position information into transformer models. The embedding is created
+    using a combination of sine and cosine functions with different frequencies.
 
     Args:
-        positions (torch.Tensor): LongTensor of positions.
-        dim (int): Dimension of the embedding.
-        max_period (float): Maximum period of the cosine/sine functions.
-        dtype (torch.dtype or str): dtype to use to generate the embedding.
+        positions (torch.Tensor): LongTensor of positions. Shape: [B, T]
+        dim (int): Dimension of the embedding (must be even).
+        max_period (float): Maximum period of the cosine/sine functions. Default: 10000
+        dtype (torch.dtype): Data type to use for the embedding. Default: torch.float32
+
     Returns:
-        torch.Tensor: Sinusoidal positional embedding.
+        torch.Tensor: Sinusoidal positional embedding. Shape: [B, T, dim]
+
+    Note:
+        - The function assumes a batch-time-channel (BTC) format for the output.
+        - The dimension (dim) must be even to allow for equal split between sine and cosine.
     """
-    # We aim for BTC format
-    assert dim % 2 == 0
+    assert dim % 2 == 0, "Embedding dimension must be even"
     half_dim = dim // 2
-    positions = positions.to(dtype)
-    adim = torch.arange(half_dim, device=positions.device, dtype=dtype).view(1, 1, -1)
+    positions = positions.to(dtype)  # Shape: [B, T]
+    adim = torch.arange(half_dim, device=positions.device, dtype=dtype).view(1, 1, -1)  # Shape: [1, 1, half_dim]
     max_period_tensor = torch.full(
         [], max_period, device=positions.device, dtype=dtype
-    )  # avoid sync point
-    phase = positions / (max_period_tensor ** (adim / (half_dim - 1)))
-    return torch.cat([torch.cos(phase), torch.sin(phase)], dim=-1)
+    )  # Scalar tensor to avoid sync point
+    phase = positions / (max_period_tensor ** (adim / (half_dim - 1)))  # Shape: [B, T, half_dim]
+    return torch.cat([torch.cos(phase), torch.sin(phase)], dim=-1)  # Shape: [B, T, dim]
 
 
 def multi_linear(
@@ -157,66 +210,116 @@ def multi_linear(
     weight: torch.Tensor,
     x: torch.Tensor,
     offset: int,
-):
-    """Utility to apply a multi linear layer to the given input. A multi linear layer
-    applies a different set of weight for each time step.
+) -> torch.Tensor:
+    """
+    Apply a multi-linear layer to the given input, where each time step uses a different set of weights.
+
+    This function implements a time-dependent linear transformation, where each time step
+    has its own set of weights. It's particularly useful in scenarios where the linear
+    transformation needs to vary across time steps, such as in certain types of
+    attention mechanisms or time-varying neural networks.
 
     Args:
-        num_linear (int): Number of possible time steps and so number of linears.
-        weight (torch.Tensor): Weight tensor, with shape `[num_linear * chout, chin]`.
-        x (torch.Tensor): Input tensor, with shape `[B, T, C]`.
-        offset (int): offset for the current time step, in particular for decoding, with
-            time steps provided one by one.
+        num_linear (int): Total number of linear transformations (typically equal to
+                          the maximum sequence length).
+        weight (torch.Tensor): Weight tensor containing all linear transformations.
+        x (torch.Tensor): Input tensor to transform.
+        offset (int): Starting index for selecting weights, useful for sequential
+                      processing or when continuing from a previous state.
+
+    Returns:
+        torch.Tensor: Transformed output tensor.
+
+    Note:
+        The function assumes that `num_linear` is at least as large as `T + offset`
+        to ensure there are enough weights for all time steps.
     """
-    B, T, C = x.shape
+    B, T, C = x.shape  # x: [B, T, chin]
     ys = []
-    chout, chin = weight.shape
-    weight = weight.view(num_linear, -1, chin)
+    chout, chin = weight.shape  # weight: [num_linear * chout, chin]
+    weight = weight.view(num_linear, -1, chin)  # weight: [num_linear, chout, chin]
     for t in range(T):
-        y = F.linear(x[:, t], weight[t + offset])
+        y = F.linear(x[:, t], weight[t + offset])  # y: [B, chout]
         ys.append(y)
-    out = torch.stack(ys, 1)
+    out = torch.stack(ys, 1)  # out: [B, T, chout]
     return out
 
 
 def set_attention_context(model: nn.Module, context: tp.Optional[int] = None) -> None:
-    """Deactivates or changes the context span (in time steps) in a model.
-    Args:
-        model (nn.Module): model over which to look for attentions.
-        context (int or None): new temporary context value.
-
-    ..Note:: this is not a context manager but a plain function changing the context forever.
-        Initially, it was a context manager, but that led to interesting bugs when using
-        activation checkpointing, with the context being inconsistent between the forward
-        and backward.
     """
-    for module in model.modules():
+    Deactivates or changes the context span (in time steps) for all StreamingMultiheadAttention modules in a model.
+
+    This function traverses the entire model and sets the 'context' attribute of all
+    StreamingMultiheadAttention modules to the specified value. This allows for dynamic
+    adjustment of the attention span in streaming scenarios.
+
+    Args:
+        model (nn.Module): The PyTorch model to modify.
+        context (int or None): New context value to set. If None, it effectively
+                               deactivates the context limitation.
+
+    Returns:
+        None
+
+    Note:
+        This is not a context manager but a plain function that permanently changes the context.
+        It was initially designed as a context manager, but this led to inconsistencies
+        between forward and backward passes when using activation checkpointing.
+
+    Example:
+        >>> model = MyTransformerModel()
+        >>> set_attention_context(model, context=100)  # Set context to 100 time steps
+        >>> set_attention_context(model, context=None)  # Remove context limitation
+    """
+    for module in model.modules():  # Iterate through all modules in the model
         if isinstance(module, StreamingMultiheadAttention):
-            module.context = context
+            module.context = context  # Set the context attribute of StreamingMultiheadAttention modules
 
 
 class KVCacheResult(tp.NamedTuple):
-    keys: torch.Tensor
-    values: torch.Tensor
-    positions: torch.Tensor
+    keys: torch.Tensor  # Shape: [B, H, T, D]
+    values: torch.Tensor  # Shape: [B, H, T, D]
+    positions: torch.Tensor  # Shape: [T]
 
     @staticmethod
     def from_kv(keys: torch.Tensor, values: torch.Tensor) -> "KVCacheResult":
+        """
+        Create a KVCacheResult from given keys and values tensors.
+
+        This method constructs a KVCacheResult object, which includes the keys,
+        values, and corresponding positions. It performs shape validation and
+        generates position indices.
+
+        Args:
+            keys (torch.Tensor): The key tensor. Shape: [B, H, T, D]
+            values (torch.Tensor): The value tensor. Shape: [B, H, T, D]
+
+        Returns:
+            KVCacheResult: A named tuple containing keys, values, and positions.
+
+        Raises:
+            AssertionError: If the shapes of keys and values are incompatible.
+        """
         B, H, T, D = keys.shape
-        assert tuple(values.shape[:-1]) == (B, H, T)
-        positions = torch.arange(T, device=keys.device, dtype=torch.long)
+        assert tuple(values.shape[:-1]) == (B, H, T), "Values shape must match keys shape except for last dimension"
+        positions = torch.arange(T, device=keys.device, dtype=torch.long)  # Shape: [T]
         return KVCacheResult(keys, values, positions)
 
 
 class RingKVCache:
-    """Efficient streaming KVCache to be compatible with Cuda Graph.
+    """
+    Efficient streaming KVCache compatible with CUDA Graph.
+
+    This class implements a ring buffer for key-value caching in transformer models,
+    allowing for efficient streaming inference.
 
     Args:
-        batch_size (int): Batch size.
-        num_heads (int): Number of heads in the attention.
-        dim_per_head (int): Dimension per head.
-        device (torch.device): Device on which to initialize the cache.
-        dtype (torch.dtype): dtype to use for the cache.
+        batch_size (int): Number of sequences in a batch.
+        num_heads (int): Number of attention heads.
+        dim_per_head (int): Dimension of each attention head.
+        capacity (int): Maximum number of time steps to store in the cache.
+        device (torch.device): Device on which to initialize the cache. Default is CUDA.
+        dtype (torch.dtype): Data type for the cache. Default is bfloat16.
     """
 
     def __init__(
@@ -229,28 +332,45 @@ class RingKVCache:
         dtype: torch.dtype = torch.bfloat16,
     ):
         self.capacity = capacity
+        #self.cache Shape: [2, B, H, T, D] where 2 is for keys and values
         self.cache = torch.zeros(
             (2, batch_size, num_heads, capacity, dim_per_head),
             device=device,
             dtype=dtype,
         )
+        
+        # Tracks the end of the valid data in the cache
         self.end_offset = torch.zeros(1, device=device, dtype=torch.long)
 
     def reset(self):
+        """Resets the cache by zeroing out the end offset."""
         self.end_offset.zero_()
 
     def complete(self, k: torch.Tensor, v: torch.Tensor) -> KVCacheResult:
+        """
+        Updates the cache with new keys and values and returns the complete cache.
+
+        Args:
+            k (torch.Tensor): New keys to add. Shape: [B, H, T, D]
+            v (torch.Tensor): New values to add. Shape: [B, H, T, D]
+
+        Returns:
+            KVCacheResult: Named tuple containing the complete keys, values, and their positions.
+        """
         assert k.shape[:-1] == v.shape[:-1], (k.shape, v.shape)
         B, H, T, D = k.shape
+        # Calculate indices for the new entries
         indexes = torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype) + self.end_offset
         indexes = indexes % self.capacity
-        self.cache[0].index_copy_(2, indexes, k)
-        self.cache[1].index_copy_(2, indexes, v)
+        # Update the cache with new keys and values
+        self.cache[0].index_copy_(2, indexes, k)  # Update keys
+        self.cache[1].index_copy_(2, indexes, v)  # Update values
         self.end_offset.add_(T)
 
-        keys = self.cache[0]
-        values = self.cache[1]
+        keys = self.cache[0]    # Shape: [B, H, T, D]
+        values = self.cache[1]  # Shape: [B, H, T, D]
 
+        # Generate position information
         indexes = torch.arange(
             self.capacity, device=self.end_offset.device, dtype=torch.long
         )
@@ -273,6 +393,7 @@ class RingKVCache:
             self.end_offset + delta,
             self.end_offset + delta - self.capacity,
         )
+        # Mark invalid positions (those not yet filled) with -1
         positions = torch.where(invalid, torch.full_like(positions, -1), positions)
 
         return KVCacheResult(keys, values, positions)
@@ -293,18 +414,30 @@ class _MHAState:
 class StreamingMultiheadAttention(StreamingModule[_MHAState]):
     """Similar to `nn.MultiheadAttention` but with support for streaming, causal evaluation.
 
+    This class implements a streaming version of multi-head attention, which can be used
+    for causal language modeling tasks. It supports both standard and streaming inference modes.
+
     Args:
-        embed_dim (int): Dimension to project to.
-        num_heads (int): Number of heads.
-        causal (bool): Causal mask applied automatically.
-        context (int, optional): Number of time steps the attention can access to.
-            When causal, can access `context` time steps into the past, and when non causal,
-            can access `context // 2` steps in the past, and the same in the future.
-        rope (`RotaryEmbedding`, optional): Rope embedding to use.
-        weights_per_step (int): use different weights per time step. If non zero, should correspond to the
-            number of possible time steps.
-        device (torch.device, optional): Device on which to initialize.
-        dtype (torch.dtype, optional): dtype to use.
+        embed_dim (int): Dimension of the input and output embeddings.
+        num_heads (int): Number of attention heads.
+        causal (bool): If True, applies a causal mask to the attention. Default is False.
+        context (int, optional): Number of time steps the attention can access.
+            For causal attention, it's the number of past steps. For non-causal,
+            it's split evenly between past and future. Default is None (unlimited context).
+        rope (`RotaryEmbedding`, optional): Rotary position embedding to use. Default is None.
+        weights_per_step (int): Number of unique weight sets to use per time step.
+            If non-zero, uses different weights for each possible time step. Default is 0.
+        device (torch.device, optional): Device on which to initialize the module.
+        dtype (torch.dtype, optional): Data type to use for module parameters.
+
+    Shape:
+        - Input: `(batch_size, seq_len, embed_dim)`
+        - Output: `(batch_size, seq_len, embed_dim)`
+
+    Attributes:
+        in_proj_weight (nn.Parameter): Combined weight for query, key, and value projections.
+        in_proj_bias (nn.Parameter): Combined bias for query, key, and value projections.
+        out_proj (nn.Linear): Output projection layer.
     """
 
     _fsdp_final = True
@@ -337,13 +470,24 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
             mult = weights_per_step
         in_proj = nn.Linear(embed_dim, mult * out_dim, bias=False, **factory_kwargs)
         # We try to follow the default PyTorch MHA convention, to easily compare results.
-        self.in_proj_weight = in_proj.weight
-        self.in_proj_bias = in_proj.bias
+        self.in_proj_weight = in_proj.weight  # Shape: [mult * 3 * embed_dim, embed_dim]
+        self.in_proj_bias = in_proj.bias  # Shape: [mult * 3 * embed_dim] or None
         self.out_proj = nn.Linear(
             embed_dim, mult * embed_dim, bias=False, **factory_kwargs
-        )
+        )  # out_proj.weight shape: [mult * embed_dim, embed_dim]
 
     def _init_streaming_state(self, batch_size: int) -> _MHAState:
+        """Initialize the streaming state for the attention module.
+
+        Args:
+            batch_size (int): Batch size for the input.
+
+        Returns:
+            _MHAState: Initialized streaming state.
+
+        Raises:
+            RuntimeError: If context is None and weights_per_step is 0.
+        """
         if self.context is None:
             if self.weights_per_step:
                 capacity = self.weights_per_step
@@ -367,6 +511,15 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         )
 
     def _complete_kv(self, k, v) -> KVCacheResult:
+        """Complete the key and value tensors using the KV cache.
+
+        Args:
+            k (torch.Tensor): Key tensor.
+            v (torch.Tensor): Value tensor.
+
+        Returns:
+            KVCacheResult: Completed key and value tensors with position information.
+        """
         state = self._streaming_state
         if state is None:
             return KVCacheResult.from_kv(k, v)
@@ -374,53 +527,64 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
             return state.kv_cache.complete(k, v)
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
+        """
+        Forward pass of the StreamingMultiheadAttention module.
+
+        Args:
+            query (torch.Tensor): Query tensor of shape (batch_size, seq_len, embed_dim)
+            key (torch.Tensor): Key tensor of shape (batch_size, seq_len, embed_dim)
+            value (torch.Tensor): Value tensor of shape (batch_size, seq_len, embed_dim)
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, embed_dim)
+        """
         state = self._streaming_state
-        T = query.shape[1]
+        T = query.shape[1]  # T: sequence length
 
         if state is None:
-            offset = torch.zeros(1, device=query.device, dtype=torch.long)
+            offset = torch.zeros(1, device=query.device, dtype=torch.long)  # Shape: (1,)
             offset_cpu = 0
         else:
             assert self.causal, "Streaming only available for causal"
-            offset = state.offset
+            offset = state.offset  # Shape: (1,)
             offset_cpu = state.offset_cpu
 
         if self.weights_per_step:
             projected = multi_linear(
                 self.weights_per_step, self.in_proj_weight, query, offset_cpu
-            )
+            )  # Shape: (batch_size, T, 3 * embed_dim * mult)
         else:
-            projected = nn.functional.linear(query, self.in_proj_weight)
+            projected = nn.functional.linear(query, self.in_proj_weight)  # Shape: (batch_size, T, 3 * embed_dim * mult)
         q, k, v = rearrange(
             projected, "b t (p h d) -> p b h t d", p=3, h=self.num_heads
-        )
+        )  # Shape of each: (batch_size, num_heads, T, dim_per_head)
 
         if self.rope:
-            q, k = self.rope(q, k, offset, time_before_heads=False)
+            q, k = self.rope(q, k, offset, time_before_heads=False)  # Shapes unchanged
 
-        k, v, pos_k = self._complete_kv(k, v)
+        k, v, pos_k = self._complete_kv(k, v)  # k, v shapes: (batch_size, num_heads, T', dim_per_head), pos_k shape: (T')
         if self.causal:
-            pos_k = pos_k.view(1, -1)
+            pos_k = pos_k.view(1, -1)  # Shape: (1, T')
             pos_q = offset + torch.arange(T, device=q.device, dtype=torch.long).view(
                 -1, 1
-            )
-            delta = pos_q - pos_k
-            attn_bias = (pos_k >= 0) & (delta >= 0)
+            )  # Shape: (T, 1)
+            delta = pos_q - pos_k  # Shape: (T, T')
+            attn_bias = (pos_k >= 0) & (delta >= 0)  # Shape: (T, T')
             if self.context is not None:
-                attn_bias = attn_bias & (delta < self.context)
+                attn_bias = attn_bias & (delta < self.context)  # Shape: (T, T')
         else:
             attn_bias = None
-        x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
+        x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)  # Shape: (batch_size, num_heads, T, dim_per_head)
 
-        x = rearrange(x, "b h t d -> b t (h d)")
+        x = rearrange(x, "b h t d -> b t (h d)")  # Shape: (batch_size, T, embed_dim)
         if self.weights_per_step:
-            x = multi_linear(self.weights_per_step, self.out_proj.weight, x, offset_cpu)
+            x = multi_linear(self.weights_per_step, self.out_proj.weight, x, offset_cpu)  # Shape: (batch_size, T, embed_dim)
         else:
-            x = self.out_proj(x)
+            x = self.out_proj(x)  # Shape: (batch_size, T, embed_dim * mult)
         if state is not None:
             state.offset.add_(T)
             state.offset_cpu += T
-        return x
+        return x  # Shape: (batch_size, T, embed_dim * mult)
 
 
 @dataclass
@@ -434,22 +598,30 @@ class _LayerState:
 class StreamingTransformerLayer(StreamingModule[_LayerState]):
     """TransformerLayer with Streaming / Causal support.
 
+    This class implements a single layer of a streaming transformer, supporting causal
+    and non-causal attention with optional context limitation. It includes self-attention
+    and feed-forward components, with various normalization and gating options.
+
     Args:
-        d_model (int): Dimension of the data.
-        num_heads (int): Number of heads.
-        dim_feedforward (int): Intermediate dimension of FF module.
-        causal (bool): Causal mask applied automatically.
-        context (int, optional): Receptive field for the causal mask, infinite if None.
-        custom (bool): Use custom MHA implementation, for testing / benchmarking.
-        rope (`RotaryEmbedding`, optional): Rope embedding to use.
-        norm (str): Normalization to use. Currently, only 'layer_norm' is supported.
-        layer_scale (float, optional): If not None, LayerScale will be used with the given value as initial scale.
-        gating (str): if provided, replaces FFN with special gating, like GLU, GSiGLU etc.
-        weights_per_step (int): use different weights per time step. If non zero, should correspond to the
-            number of possible time steps.
-        skip_self_attn: If true, skips the self attention module and the norm
-        device (torch.device, optional): Device on which to initialize.
-        dtype (torch.dtype, optional): dtype to use.
+        d_model (int): Dimension of the model (input and output).
+        num_heads (int): Number of attention heads.
+        dim_feedforward (int | list[int]): Dimension(s) of the feedforward network.
+            If a list, must match weights_per_step.
+        causal (bool): If True, applies causal masking to the attention. Default is False.
+        context (int, optional): Maximum context size for attention. If None, unlimited.
+        rope (`RotaryEmbedding`, optional): Rotary position embedding to use.
+        norm (str): Type of normalization to use. Currently only 'layer_norm' is supported.
+        layer_scale (float, optional): Initial scale for LayerScale. If None, LayerScale is not used.
+        gating (str): Type of gating mechanism for the feedforward network.
+        weights_per_step (int): Number of unique weight sets to use per time step.
+        activation (callable): Activation function for the feedforward network.
+        skip_self_attn (bool): If True, skips the self-attention module and its normalization.
+        device (torch.device, optional): Device on which to initialize the layer.
+        dtype (torch.dtype, optional): Data type to use for layer parameters.
+
+    Shape:
+        - Input: `(batch_size, seq_len, d_model)`
+        - Output: `(batch_size, seq_len, d_model)`
     """
 
     _fsdp_final = True
@@ -547,49 +719,82 @@ class StreamingTransformerLayer(StreamingModule[_LayerState]):
     def _init_streaming_state(self, batch_size: int) -> _LayerState:
         return _LayerState(offset_cpu=0)
 
-    # feed forward block
     def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
+        """Feed-forward block of the transformer layer.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_model)
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, d_model)
+        """
         state = self._streaming_state
         offset = 0
         if state is not None:
             offset = state.offset_cpu
-        x_orig = x
-        x = self.norm2(x)
+        x_orig = x  # Shape: (batch_size, seq_len, d_model)
+        x = self.norm2(x)  # Shape: (batch_size, seq_len, d_model)
         if self.gating is None:
             assert self.linear1 is not None
             assert self.linear2 is not None
-            update = self.linear2(self.activation(self.linear1(x)))
+            # Shape: (batch_size, seq_len, dim_feedforward)
+            hidden = self.activation(self.linear1(x))
+            # Shape: (batch_size, seq_len, d_model)
+            update = self.linear2(hidden)
         else:
             if self.weights_per_step:
                 assert isinstance(self.gating, nn.ModuleList)
                 B, T, D = x.shape
                 ys = []
                 for t in range(T):
+                    # Shape: (batch_size, 1, d_model)
                     y = self.gating[offset + t](x[:, t : t + 1])
                     ys.append(y)
+                # Shape: (batch_size, seq_len, d_model)
                 update = torch.cat(ys, dim=1)
             else:
+                # Shape: (batch_size, seq_len, d_model)
                 update = self.gating(x)
+        # Shape: (batch_size, seq_len, d_model)
         return x_orig + self.layer_scale_2(update)
 
-    def _sa_block(self, x: torch.Tensor):
+    def _sa_block(self, x: torch.Tensor) -> torch.Tensor:
+        """Self-attention block of the transformer layer.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_model)
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, d_model)
+        """
         if self.skip_self_attn:
             return x
-        x_orig = x
-        x = self.norm1(x)
+        x_orig = x  # Shape: (batch_size, seq_len, d_model)
+        x = self.norm1(x)  # Shape: (batch_size, seq_len, d_model)
+        # Shape: (batch_size, seq_len, d_model)
         update = self.self_attn(x, x, x)
+        # Shape: (batch_size, seq_len, d_model)
         return x_orig + self.layer_scale_1(update)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the StreamingTransformerLayer.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_model)
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, d_model)
+        """
         with ExitStack() as stack:
             if x.device.type != 'cuda':
                 stack.enter_context(no_compile())
-            x = self._sa_block(x)
-            x = self._ff_block(x)
+            x = self._sa_block(x)  # Shape: (batch_size, seq_len, d_model)
+            x = self._ff_block(x)  # Shape: (batch_size, seq_len, d_model)
             state = self._streaming_state
             if state:
                 state.offset_cpu += x.shape[1]
-            return x
+            return x  # Shape: (batch_size, seq_len, d_model)
 
 
 @dataclass
